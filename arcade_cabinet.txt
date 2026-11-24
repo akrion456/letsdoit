@@ -1,0 +1,116 @@
+-- ============================================================
+--  Arcade Cabinet (Prop2Mesh) - SINGLE FILE StarfallEx chip
+-- ============================================================
+-- Spawns a Prop2Mesh arcade cabinet textured with
+-- DefaultMaterial.png (4096x4096).
+--
+-- HOW TO USE
+--   1. Copy DefaultMaterial.png into  garrysmod/data/
+--   2. Copy arcadecabinet.obj  into  garrysmod/data/
+--   3. Spawn this file as a SERVER Starfall chip.
+--   4. Spawn this SAME file as a CLIENT Starfall chip.
+--   5. Grant the "Create material from image" permission.
+--
+-- The cabinet appears at the server chip's position.
+--
+-- SINGLEPLAYER: works fully (you see the cabinet).
+-- MULTIPLAYER:  the mesh is built on the spawner's client, so the
+--   spawner sees it. Other players will NOT see the mesh, because a
+--   Starfall chip cannot push .obj data to the server (Prop2Mesh's
+--   Starfall API only accepts .mdl model paths server-side, and the
+--   chip sandbox cannot send the raw upload net messages).
+--   For true multiplayer (everyone sees it), convert the .obj to a
+--   .mdl and use the server-only chip in the README.
+-- ============================================================
+
+if SERVER then
+    ------------------------------------------------------------
+    -- SERVER: create the Prop2Mesh entity and apply the texture.
+    ------------------------------------------------------------
+
+    -- Create the Prop2Mesh entity (1 controller) at the chip.
+    local ent = p2m.create(1, chip():getPos(), chip():getAngles())
+
+    -- Tell the client chip which entity to put the mesh on.
+    local function sendTarget()
+        net.start("arcade_p2m_target")
+        net.writeEntity(ent)
+        net.send(owner())
+    end
+    sendTarget()
+
+    -- The client chip sends us the texture material's name; apply it.
+    net.receive("arcade_p2m_hello", function()
+        local matName = net.readString()
+        if ent:isValid() then
+            ent:p2mSetMaterial(1, matName)
+        end
+        sendTarget() -- make sure the client has the entity
+    end)
+
+elseif CLIENT then
+    ------------------------------------------------------------
+    -- CLIENT: create the texture and build the mesh from the OBJ.
+    ------------------------------------------------------------
+
+    local TEXTURE_PATH = "data/DefaultMaterial.png"
+    local MODEL_PATH   = "data/arcadecabinet.obj"
+    local PART_KEY     = 1 -- links the part to its OBJ text
+
+    -- 1. Create the texture material from the PNG.
+    --    Runtime materials are referenced with a "!" prefix.
+    local mat = material.createFromImage(TEXTURE_PATH, "smooth")
+    local matName = "!" .. mat:getName()
+
+    -- 2. Tell the server the material name so it can apply it.
+    local function sendHello()
+        net.start("arcade_p2m_hello")
+        net.writeString(matName)
+        net.send()
+    end
+    sendHello()
+
+    -- 3. Build + apply the mesh once the server gives us the entity.
+    local targetEnt = nil
+    local meshApplied = false
+
+    local function applyMesh()
+        if not targetEnt or not targetEnt:isValid() or meshApplied then return end
+
+        local objText = file.readInGame(MODEL_PATH)
+        if not objText then return end
+
+        -- One OBJ part. Prop2Mesh's mesh builder skips mtllib/usemtl/o/vn
+        -- lines, so the raw .obj can be handed over as-is.
+        --   ang pitches +90 deg because the .obj is Y-up while GMod is Z-up.
+        --   pos centers (x) and grounds (z) this specific model.
+        -- pos/ang are Vector/Angle; scale is an array (indexed [1..3]).
+        local partlist = {}
+        partlist[1] = {
+            pos = Vector(-21.5, 0, -1),
+            ang = Angle(90, 0, 0),
+            scale = {1, 1, 1},
+            vinvert = 0, vinside = 0, vsmooth = 0,
+            submodels = {}, clips = {},
+            objn = "arcadecabinet",
+            objd = PART_KEY,
+        }
+        partlist.custom = { [PART_KEY] = objText }
+
+        targetEnt:p2mSetControllerInfo(1, partlist)
+        meshApplied = true
+    end
+
+    local firstTarget = true
+    net.receive("arcade_p2m_target", function()
+        targetEnt = net.readEntity()
+        applyMesh()
+        -- Re-send hello once (only on the first target) in case the
+        -- server chip spawned after us and missed our initial hello.
+        -- The flag stops this from ping-ponging with the server.
+        if firstTarget then
+            firstTarget = false
+            sendHello()
+        end
+    end)
+end
