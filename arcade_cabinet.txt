@@ -1,116 +1,549 @@
+--@name Arcade Cabinet (Prop2Mesh)
+--@shared
+
 -- ============================================================
---  Arcade Cabinet (Prop2Mesh) - SINGLE FILE StarfallEx chip
+--  Arcade Cabinet (Prop2Mesh) - Single-File StarfallEx Chip
 -- ============================================================
 -- Spawns a Prop2Mesh arcade cabinet textured with
 -- DefaultMaterial.png (4096x4096).
 --
--- HOW TO USE
+-- SETUP (only the chip owner needs the files on disk):
 --   1. Copy DefaultMaterial.png into  garrysmod/data/
 --   2. Copy arcadecabinet.obj  into  garrysmod/data/
---   3. Spawn this file as a SERVER Starfall chip.
---   4. Spawn this SAME file as a CLIENT Starfall chip.
---   5. Grant the "Create material from image" permission.
+--   3. Spawn this file ONCE as a Starfall Processor chip.
 --
--- The cabinet appears at the server chip's position.
---
--- SINGLEPLAYER: works fully (you see the cabinet).
--- MULTIPLAYER:  the mesh is built on the spawner's client, so the
---   spawner sees it. Other players will NOT see the mesh, because a
---   Starfall chip cannot push .obj data to the server (Prop2Mesh's
---   Starfall API only accepts .mdl model paths server-side, and the
---   chip sandbox cannot send the raw upload net messages).
---   For true multiplayer (everyone sees it), convert the .obj to a
---   .mdl and use the server-only chip in the README.
+-- SINGLEPLAYER & MULTIPLAYER:
+--   - Works from a single spawned Starfall chip (--@shared runs
+--     on both the server and every connected client).
+--   - In multiplayer, other players do NOT need the .obj or .png
+--     in their own data/ folder: the chip owner's client streams
+--     the condensed .obj mesh and .png texture through the server
+--     to every other player's client (caching the texture in
+--     Starfall temp storage so repeat visits load instantly).
+--   - If a player has restricted Starfall client permissions,
+--     pressing E (Use) on the chip grants the permission prompt.
 -- ============================================================
 
 if SERVER then
-    ------------------------------------------------------------
-    -- SERVER: create the Prop2Mesh entity and apply the texture.
-    ------------------------------------------------------------
-
-    -- Create the Prop2Mesh entity (1 controller) at the chip.
     local ent = p2m.create(1, chip():getPos(), chip():getAngles())
-
-    -- Tell the client chip which entity to put the mesh on.
-    local function sendTarget()
-        net.start("arcade_p2m_target")
-        net.writeEntity(ent)
-        net.send(owner())
+    if not ent or not ent:isValid() then
+        print("[ArcadeCabinet] Failed to create Prop2Mesh entity (limit reached?).")
+        return
     end
-    sendTarget()
 
-    -- The client chip sends us the texture material's name; apply it.
-    net.receive("arcade_p2m_hello", function()
+    pcall(ent.setParent, ent, chip())
+    ent:p2mSetLink(1, chip(), Vector(0, 0, 0), Angle(0, 0, 0))
+
+    local cachedObj = nil
+    local cachedPng = nil
+    local cachedPngKey = ""
+    local pullingPng = false
+    local pendingPngPlys = {}
+    local sendQueue = {}
+    local activePerPly = {}
+
+    local function sendInit(target)
+        if not ent:isValid() then return end
+        net.start("ac_init")
+        net.writeEntity(ent)
+        net.writeBool(cachedObj ~= nil)
+        net.writeString(cachedPngKey)
+        if target then
+            net.send(target)
+        else
+            net.send()
+        end
+    end
+
+    local function enqueueStream(ply, msg, data, compress)
+        if not ply or not ply:isValid() or not data then return end
+        for i = 1, #sendQueue do
+            local item = sendQueue[i]
+            if item.ply == ply and item.msg == msg then
+                return
+            end
+        end
+        sendQueue[#sendQueue + 1] = {
+            ply = ply,
+            msg = msg,
+            data = data,
+            compress = compress,
+        }
+    end
+
+    timer.create("ac_sv_pump", 0.2, 0, function()
+        local now = timer.realtime()
+
+        for ply, startedAt in pairs(activePerPly) do
+            if not ply:isValid() or (now - startedAt) > 120 then
+                activePerPly[ply] = nil
+            end
+        end
+
+        local idx = 1
+        while idx <= #sendQueue and net.canWriteStream() do
+            local item = sendQueue[idx]
+            if not item.ply:isValid() then
+                table.remove(sendQueue, idx)
+            elseif not activePerPly[item.ply] then
+                table.remove(sendQueue, idx)
+                activePerPly[item.ply] = now
+                net.start(item.msg)
+                net.writeStream(item.data, item.compress)
+                net.send(item.ply)
+            else
+                idx = idx + 1
+            end
+        end
+
+        if next(pendingPngPlys) ~= nil
+            and not cachedPng
+            and not pullingPng
+            and cachedObj ~= nil
+            and cachedPngKey ~= ""
+            and net.canReadStream()
+            and owner():isValid()
+        then
+            pullingPng = true
+            net.start("ac_pull_png")
+            net.send(owner())
+        end
+    end)
+
+    net.receive("ac_hello", function(_, ply)
+        sendInit(ply)
+    end)
+
+    net.receive("ac_owner_mat", function(_, ply)
+        if ply ~= owner() then return end
         local matName = net.readString()
-        if ent:isValid() then
+        if ent:isValid() and matName ~= "" then
             ent:p2mSetMaterial(1, matName)
         end
-        sendTarget() -- make sure the client has the entity
+    end)
+
+    net.receive("ac_png_meta", function(_, ply)
+        if ply ~= owner() then return end
+        cachedPngKey = net.readString()
+        sendInit(nil)
+    end)
+
+    net.receive("ac_upload_obj", function(_, ply)
+        if ply ~= owner() or not net.canReadStream() then return end
+        net.readStream(function(data)
+            if data and #data > 0 then
+                cachedObj = data
+                sendInit(nil)
+            end
+        end)
+    end)
+
+    net.receive("ac_upload_png", function(_, ply)
+        if ply ~= owner() or not net.canReadStream() then
+            pullingPng = false
+            return
+        end
+        net.readStream(function(data)
+            pullingPng = false
+            if data and #data > 0 then
+                cachedPng = data
+                for waitPly in pairs(pendingPngPlys) do
+                    if waitPly:isValid() then
+                        enqueueStream(waitPly, "ac_stream_png", cachedPng, false)
+                    end
+                end
+                pendingPngPlys = {}
+            end
+        end)
+    end)
+
+    net.receive("ac_stream_done", function(_, ply)
+        activePerPly[ply] = nil
+    end)
+
+    net.receive("ac_req_obj", function(_, ply)
+        if cachedObj then
+            enqueueStream(ply, "ac_stream_obj", cachedObj, true)
+        end
+    end)
+
+    net.receive("ac_req_png", function(_, ply)
+        if cachedPng then
+            enqueueStream(ply, "ac_stream_png", cachedPng, false)
+        else
+            pendingPngPlys[ply] = true
+        end
     end)
 
 elseif CLIENT then
-    ------------------------------------------------------------
-    -- CLIENT: create the texture and build the mesh from the OBJ.
-    ------------------------------------------------------------
+    setupPermissionRequest(
+        { "material.create", "material.imagecreate", "file.writeTemp", "entities.setRenderProperty" },
+        "Load and display the Arcade Cabinet Prop2Mesh model and texture",
+        true
+    )
 
-    local TEXTURE_PATH = "data/DefaultMaterial.png"
-    local MODEL_PATH   = "data/arcadecabinet.obj"
-    local PART_KEY     = 1 -- links the part to its OBJ text
+    local MODEL_PATHS = {
+        "data/arcadecabinet.obj",
+        "data/sf_filedata/arcadecabinet.obj",
+        "data/sf_filedata/arcadecabinet.txt",
+    }
+    local TEXTURE_PATHS = {
+        "data/DefaultMaterial.png",
+        "data/sf_filedata/DefaultMaterial.png",
+    }
+    local PART_KEY = 1
 
-    -- 1. Create the texture material from the PNG.
-    --    Runtime materials are referenced with a "!" prefix.
-    local mat = material.createFromImage(TEXTURE_PATH, "smooth")
-    local matName = "!" .. mat:getName()
-
-    -- 2. Tell the server the material name so it can apply it.
-    local function sendHello()
-        net.start("arcade_p2m_hello")
-        net.writeString(matName)
-        net.send()
-    end
-    sendHello()
-
-    -- 3. Build + apply the mesh once the server gives us the entity.
     local targetEnt = nil
+    local partlist = nil
     local meshApplied = false
+    local wasDormant = false
+    local resyncAfter = 0
 
-    local function applyMesh()
-        if not targetEnt or not targetEnt:isValid() or meshApplied then return end
+    local dynMat = nil
+    local localMatName = nil
+    local textureApplied = false
 
-        local objText = file.readInGame(MODEL_PATH)
-        if not objText then return end
+    local serverHasObj = false
+    local serverPngKey = ""
+    local requestingObj = false
+    local requestingPng = false
+    local pendingPngBytes = nil
 
-        -- One OBJ part. Prop2Mesh's mesh builder skips mtllib/usemtl/o/vn
-        -- lines, so the raw .obj can be handed over as-is.
-        --   ang pitches +90 deg because the .obj is Y-up while GMod is Z-up.
-        --   pos centers (x) and grounds (z) this specific model.
-        -- pos/ang are Vector/Angle; scale is an array (indexed [1..3]).
-        local partlist = {}
-        partlist[1] = {
-            pos = Vector(-21.5, 0, -1),
-            ang = Angle(90, 0, 0),
-            scale = {1, 1, 1},
-            vinvert = 0, vinside = 0, vsmooth = 0,
-            submodels = {}, clips = {},
-            objn = "arcadecabinet",
-            objd = PART_KEY,
-        }
-        partlist.custom = { [PART_KEY] = objText }
+    local ownerPngBytes = nil
+    local uploadingPng = false
 
-        targetEnt:p2mSetControllerInfo(1, partlist)
-        meshApplied = true
+    local function applyLocalMaterialOverride()
+        if not localMatName or not targetEnt or not targetEnt:isValid() then return end
+        local parents = { chip(), targetEnt }
+        for p = 1, #parents do
+            local parent = parents[p]
+            if parent and parent:isValid() then
+                local okKids, kids = pcall(parent.getChildren, parent)
+                if okKids and kids then
+                    for i = 1, #kids do
+                        local child = kids[i]
+                        if child and child:isValid() and child ~= targetEnt then
+                            if hasPermission("entities.setRenderProperty", child) then
+                                pcall(child.setMaterial, child, localMatName)
+                            end
+                        end
+                    end
+                end
+            end
+        end
     end
 
-    local firstTarget = true
-    net.receive("arcade_p2m_target", function()
-        targetEnt = net.readEntity()
-        applyMesh()
-        -- Re-send hello once (only on the first target) in case the
-        -- server chip spawned after us and missed our initial hello.
-        -- The flag stops this from ping-ponging with the server.
-        if firstTarget then
-            firstTarget = false
-            sendHello()
+    local function ensureBaseMat()
+        if dynMat then return true end
+        if not hasPermission("material.create") then return false end
+        local ok, m = pcall(material.create, "VertexLitGeneric")
+        if not ok or not m then return false end
+        dynMat = m
+        dynMat:setTexture("$basetexture", "color/white")
+        dynMat:recompute()
+        localMatName = "!" .. dynMat:getName()
+        if OWNER then
+            net.start("ac_owner_mat")
+            net.writeString(localMatName)
+            net.send()
+        end
+        return true
+    end
+
+    local function applyTextureFromPath(imgPath)
+        if textureApplied then return true end
+        if not ensureBaseMat() then return false end
+        if not hasPermission("material.imagecreate", imgPath) then return false end
+        local ok, imgMat = pcall(material.createFromImage, imgPath, "smooth mips")
+        if not ok or not imgMat then return false end
+        local tex = imgMat:getTexture("$basetexture")
+        if not tex then return false end
+        dynMat:setTexture("$basetexture", tex)
+        dynMat:recompute()
+        textureApplied = true
+        applyLocalMaterialOverride()
+        return true
+    end
+
+    local function buildPartlist(objText)
+        -- The .obj is Y-up while GMod is Z-up, so pitch +90 deg and offset
+        -- (-21.5, 0, -1) to center and ground the arcade cabinet at the chip.
+        partlist = {
+            [1] = {
+                pos = Vector(-21.5, 0, -1),
+                ang = Angle(90, 0, 0),
+                scale = { 1, 1, 1 },
+                vinvert = 0,
+                vinside = 0,
+                vsmooth = 0,
+                submodels = {},
+                clips = {},
+                objn = "arcadecabinet",
+                objd = PART_KEY,
+            },
+            custom = { [PART_KEY] = objText },
+        }
+        meshApplied = false
+    end
+
+    -- Periodically ensures the client-side mesh and material stay applied,
+    -- waiting for sent_prop2mesh's initial prop2mesh_sync and re-applying if
+    -- the entity ever leaves and re-enters PVS.
+    timer.create("ac_cl_watch", 0.25, 0, function()
+        if not targetEnt or not targetEnt:isValid() or not partlist then return end
+
+        if targetEnt:isDormant() then
+            wasDormant = true
+            meshApplied = false
+            return
+        end
+
+        local now = timer.realtime()
+        if wasDormant then
+            wasDormant = false
+            resyncAfter = now + 0.35
+        end
+
+        if not meshApplied and now >= resyncAfter then
+            local ok = pcall(targetEnt.p2mSetControllerInfo, targetEnt, 1, partlist)
+            if ok then
+                meshApplied = true
+                applyLocalMaterialOverride()
+            end
+        elseif meshApplied then
+            applyLocalMaterialOverride()
         end
     end)
+
+    ensureBaseMat()
+
+    local function sendStreamDone()
+        net.start("ac_stream_done")
+        net.send()
+    end
+
+    local function saveAndApplyPng(data)
+        if textureApplied or not data or serverPngKey == "" then return end
+        if not hasPermission("file.writeTemp") then return end
+        if file.getWriteTempBurstBytes() < #data then
+            if not timer.exists("ac_wait_tempburst") then
+                timer.create("ac_wait_tempburst", 1, 0, function()
+                    if textureApplied or not pendingPngBytes then
+                        timer.remove("ac_wait_tempburst")
+                        return
+                    end
+                    if file.getWriteTempBurstBytes() >= #pendingPngBytes then
+                        timer.remove("ac_wait_tempburst")
+                        saveAndApplyPng(pendingPngBytes)
+                    end
+                end)
+            end
+            return
+        end
+        local ok, tempPath = pcall(file.writeTemp, serverPngKey, data)
+        if ok and tempPath then
+            pendingPngBytes = nil
+            applyTextureFromPath(tempPath)
+        end
+    end
+
+    local function checkClientDownloads()
+        if OWNER then return end
+        ensureBaseMat()
+
+        -- 1. Download the condensed .obj mesh first (~127 KB compressed).
+        if not partlist then
+            if serverHasObj and not requestingObj and net.canReadStream() then
+                requestingObj = true
+                net.start("ac_req_obj")
+                net.send()
+            end
+            return
+        end
+
+        -- 2. Load the 4K PNG from Starfall temp cache if already cached,
+        --    otherwise stream it once from the server and cache it.
+        if not textureApplied and not requestingObj and serverPngKey ~= "" then
+            local okCached, cachedPath = pcall(file.existsTemp, serverPngKey)
+            if okCached and cachedPath then
+                if applyTextureFromPath(cachedPath) then return end
+            end
+
+            if pendingPngBytes then
+                saveAndApplyPng(pendingPngBytes)
+                return
+            end
+
+            if not requestingPng
+                and net.canReadStream()
+                and hasPermission("file.writeTemp")
+                and hasPermission("material.imagecreate", "data/" .. serverPngKey)
+            then
+                requestingPng = true
+                net.start("ac_req_png")
+                net.send()
+            end
+        end
+    end
+
+    local function tryOwnerTexture()
+        if not OWNER or textureApplied then return end
+        for i = 1, #TEXTURE_PATHS do
+            if applyTextureFromPath(TEXTURE_PATHS[i]) then
+                return
+            end
+        end
+    end
+
+    if OWNER then
+        tryOwnerTexture()
+
+        local rawObj
+        for i = 1, #MODEL_PATHS do
+            local data = file.readInGame(MODEL_PATHS[i])
+            if data and #data > 0 then
+                rawObj = data
+                break
+            end
+        end
+
+        if not rawObj then
+            print("[ArcadeCabinet] Could not find garrysmod/data/arcadecabinet.obj!")
+        else
+            -- Strip unused normals/materials in a quota-safe coroutine so the
+            -- mesh is smaller and faster to build and stream in multiplayer.
+            local condenseJob = coroutine.wrap(function()
+                local out = {}
+                local count = 0
+                for line in string.gmatch(rawObj, "([^\r\n]+)") do
+                    local h2 = string.sub(line, 1, 2)
+                    if h2 == "v " or string.sub(line, 1, 3) == "vt " then
+                        count = count + 1
+                        out[count] = line
+                    elseif h2 == "f " then
+                        count = count + 1
+                        out[count] = string.gsub(line, "(%d+/%d+)/%d+", "%1")
+                    end
+                    if count % 400 == 0 and cpuAverage() > cpuMax() * 0.4 then
+                        coroutine.yield(false)
+                    end
+                end
+                return table.concat(out, "\n") .. "\n"
+            end)
+
+            hook.add("think", "ac_condense_obj", function()
+                local res = condenseJob()
+                if not res then return end
+                hook.remove("think", "ac_condense_obj")
+                rawObj = nil
+
+                buildPartlist(res)
+
+                if not game.isSinglePlayer() then
+                    timer.create("ac_upload_obj_wait", 0.1, 0, function()
+                        if net.canWriteStream() then
+                            timer.remove("ac_upload_obj_wait")
+                            net.start("ac_upload_obj")
+                            net.writeStream(res, true)
+                            net.send()
+                        end
+                    end)
+                end
+            end)
+        end
+
+        if not game.isSinglePlayer() then
+            local function readPngAsync(idx)
+                if idx > #TEXTURE_PATHS then return end
+                file.asyncReadInGame(TEXTURE_PATHS[idx], function(_, status, data)
+                    if status == 0 and data and #data > 0 then
+                        ownerPngBytes = data
+                        local sample = #data .. ":" .. string.sub(data, 1, 4096) .. string.sub(data, -4096)
+                        local key = "ac_tex_" .. crc(sample) .. ".png"
+                        net.start("ac_png_meta")
+                        net.writeString(key)
+                        net.send()
+                    else
+                        readPngAsync(idx + 1)
+                    end
+                end)
+            end
+            readPngAsync(1)
+        end
+
+        net.receive("ac_pull_png", function()
+            if uploadingPng or not ownerPngBytes then return end
+            uploadingPng = true
+            timer.create("ac_upload_png_wait", 0.2, 0, function()
+                if net.canWriteStream() then
+                    timer.remove("ac_upload_png_wait")
+                    net.start("ac_upload_png")
+                    net.writeStream(ownerPngBytes, false)
+                    net.send()
+                    uploadingPng = false
+                end
+            end)
+        end)
+    end
+
+    net.receive("ac_init", function()
+        net.readEntity(function(ent)
+            if ent and ent:isValid() and ent ~= targetEnt then
+                targetEnt = ent
+                meshApplied = false
+                applyLocalMaterialOverride()
+            end
+        end)
+        serverHasObj = net.readBool()
+        local key = net.readString()
+        if key ~= "" then
+            serverPngKey = key
+        end
+        checkClientDownloads()
+    end)
+
+    net.receive("ac_stream_obj", function()
+        if not net.canReadStream() then
+            requestingObj = false
+            sendStreamDone()
+            return
+        end
+        net.readStream(function(data)
+            requestingObj = false
+            sendStreamDone()
+            if data and #data > 0 then
+                buildPartlist(data)
+            end
+            checkClientDownloads()
+        end)
+    end)
+
+    net.receive("ac_stream_png", function()
+        if not net.canReadStream() then
+            requestingPng = false
+            sendStreamDone()
+            return
+        end
+        net.readStream(function(data)
+            requestingPng = false
+            sendStreamDone()
+            if data and #data > 0 then
+                pendingPngBytes = data
+                saveAndApplyPng(data)
+            end
+        end)
+    end)
+
+    hook.add("permissionrequest", "ac_perms", function()
+        ensureBaseMat()
+        if OWNER then
+            tryOwnerTexture()
+        else
+            checkClientDownloads()
+        end
+        applyLocalMaterialOverride()
+    end)
+
+    net.start("ac_hello")
+    net.send()
 end
